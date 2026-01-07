@@ -274,22 +274,39 @@ class PunctuationSplitter(SplitStrategy):
 class LLMAssistSplitter(SplitStrategy):
     """LLM辅助分段策略"""
     
-    def __init__(self, config: dict, context: Context):
+    def __init__(self, config: dict, context: Context, event_origin: str = None,
+                 live_config: AstrBotConfig = None):
         super().__init__(config)
         self.context = context
+        self.event_origin = event_origin
+        self.live_config = live_config  # 保持对原始配置对象的引用，用于实时读取
     
     async def split_async(self, text: str) -> SplitResult:
         """异步分段（需要调用LLM）"""
         target_segments = self.config.get("target_segments", 3)
-        provider_id = self.config.get("llm_assist_provider_id", "")
-        prompt_template = self.config.get("llm_split_prompt", 
+        
+        # 关键修复：从live_config实时读取provider_id，而不是用缓存的config字典
+        if self.live_config:
+            provider_id = self.live_config.get("llm_assist_provider_id", "")
+        else:
+            provider_id = self.config.get("llm_assist_provider_id", "")
+        
+        prompt_template = self.config.get("llm_split_prompt",
             "请将以下文本分成{n}个段落，要求每段语义完整，长度尽量均匀。仅输出JSON数组格式，如: [\"段1\", \"段2\", \"段3\"]\n\n原文：\n{text}")
         
-        # 获取Provider
+        logger.info(f"[Nova-Splitter] 读取到的provider_id: '{provider_id}'")
+        
+        # 获取Provider - 按照emoji_like插件的正确写法
+        provider = None
         if provider_id:
             provider = self.context.get_provider_by_id(provider_id)
-        else:
-            provider = self.context.get_using_provider()
+            if not provider:
+                logger.warning(f"[Nova-Splitter] 未找到指定Provider: {provider_id}")
+        
+        # 如果未找到指定provider或未配置，使用当前会话的provider
+        if not provider:
+            logger.info(f"[Nova-Splitter] 使用会话默认Provider, origin={self.event_origin}")
+            provider = self.context.get_using_provider(self.event_origin)
         
         if not provider or not isinstance(provider, Provider):
             logger.warning("[Nova-Splitter] 未找到LLM Provider，回退到按字数分段")
@@ -407,23 +424,31 @@ class NovaSplitterPlugin(Star):
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
         """标记LLM响应"""
         setattr(event, "__is_llm_reply", True)
+        logger.info(f"[Nova-Splitter] 检测到LLM响应，已标记事件")
     
     @filter.on_decorating_result(priority=-100000000000000000)
     async def on_decorating_result(self, event: AstrMessageEvent):
         """处理消息分段"""
+        logger.info(f"[Nova-Splitter] on_decorating_result 触发")
+        
         # 防重入检查
         if getattr(event, "__nova_splitter_processed", False):
+            logger.info(f"[Nova-Splitter] 已处理过，跳过")
             return
         
         result = event.get_result()
         if not result or not result.chain:
+            logger.info(f"[Nova-Splitter] 无结果或chain为空")
             return
         
         # 作用范围检查
         split_scope = self.config.get("split_scope", "llm_only")
         is_llm_reply = getattr(event, "__is_llm_reply", False)
         
+        logger.info(f"[Nova-Splitter] split_scope={split_scope}, is_llm_reply={is_llm_reply}")
+        
         if split_scope == "llm_only" and not is_llm_reply:
+            logger.info(f"[Nova-Splitter] 非LLM回复，跳过")
             return
         
         # 提取文本内容
@@ -433,11 +458,14 @@ class NovaSplitterPlugin(Star):
                 full_text += comp.text
         
         if not full_text.strip():
+            logger.info(f"[Nova-Splitter] 文本为空，跳过")
             return
         
         # 长度检查
         min_length = self.config.get("max_length_no_split", 50)
+        logger.info(f"[Nova-Splitter] 文本长度={len(full_text)}, 阈值={min_length}")
         if len(full_text) < min_length:
+            logger.info(f"[Nova-Splitter] 文本过短，跳过")
             return
         
         # 标记已处理
@@ -445,9 +473,12 @@ class NovaSplitterPlugin(Star):
         
         # 选择分段策略
         split_mode = self.config.get("split_mode", "char_count")
+        logger.info(f"[Nova-Splitter] 开始处理，模式={split_mode}, 文本长度={len(full_text)}")
         
         if split_mode == "llm_assist" and self.config.get("enable_llm_assist", False):
-            splitter = LLMAssistSplitter(dict(self.config), self.context)
+            # 关键：传入self.config引用，用于实时读取provider_id
+            splitter = LLMAssistSplitter(dict(self.config), self.context,
+                                          event.unified_msg_origin, self.config)
             split_result = await splitter.split_async(full_text)
         elif split_mode == "punctuation":
             splitter = PunctuationSplitter(dict(self.config))
