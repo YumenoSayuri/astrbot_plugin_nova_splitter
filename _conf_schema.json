@@ -1,0 +1,144 @@
+{
+  "split_mode": {
+    "type": "string",
+    "options": ["char_count", "punctuation", "llm_assist", "hybrid"],
+    "default": "char_count",
+    "description": "分段模式",
+    "hint": "char_count: 按字数均分; punctuation: 按标点分段; llm_assist: LLM智能分段; hybrid: 混合模式"
+  },
+  "target_segments": {
+    "type": "int",
+    "default": 3,
+    "description": "目标分段数量",
+    "hint": "希望将消息分成几段发送"
+  },
+  "split_punctuation": {
+    "type": "string",
+    "default": "。！？!?；;\n",
+    "description": "用于分段的标点符号",
+    "hint": "遇到这些标点时会考虑分段"
+  },
+  "punctuation_clean_mode": {
+    "type": "string",
+    "options": ["edge_only", "replace_space", "preserve", "custom"],
+    "default": "edge_only",
+    "description": "标点清理模式",
+    "hint": "edge_only: 仅清理分段边界标点; replace_space: 指定标点替换为空格; preserve: 完全保留; custom: 自定义正则"
+  },
+  "edge_clean_chars": {
+    "type": "string",
+    "default": "，,、",
+    "description": "边界清理的标点(edge_only模式)",
+    "hint": "这些标点仅在分段边界处被删除，句内保留"
+  },
+  "space_replace_chars": {
+    "type": "string",
+    "default": "",
+    "description": "替换为空格的标点(replace_space模式)",
+    "hint": "这些标点会被替换为空格"
+  },
+  "custom_clean_regex": {
+    "type": "string",
+    "default": "",
+    "description": "自定义清理正则(custom模式)",
+    "hint": "使用正则表达式自定义清理规则"
+  },
+  "enable_smart_split": {
+    "type": "bool",
+    "default": true,
+    "description": "智能识别配对符号",
+    "hint": "开启后避免在引号、括号等配对符号内部断句"
+  },
+  "max_segments": {
+    "type": "int",
+    "default": 7,
+    "description": "最大分段数量",
+    "hint": "超过此数量的段落会被合并到最后一段"
+  },
+  "min_segment_length": {
+    "type": "int",
+    "default": 10,
+    "description": "最小段落长度",
+    "hint": "防止分段过短"
+  },
+  "max_length_no_split": {
+    "type": "int",
+    "default": 50,
+    "description": "不分段阈值",
+    "hint": "消息字数低于此值时不进行分段"
+  },
+  "split_scope": {
+    "type": "string",
+    "options": ["llm_only", "all"],
+    "default": "llm_only",
+    "description": "分段作用范围",
+    "hint": "llm_only: 仅对LLM回复分段; all: 对所有消息分段"
+  },
+  "enable_llm_assist": {
+    "type": "bool",
+    "default": false,
+    "description": "启用LLM辅助分段",
+    "hint": "使用LLM来智能判断如何分段（会增加API调用）"
+  },
+  "llm_assist_provider_id": {
+    "type": "string",
+    "default": "",
+    "description": "LLM分段使用的提供商",
+    "hint": "留空则使用当前正在使用的LLM提供商。LLM辅助分段任务较简单，建议选择稳定的模型",
+    "_special": "select_provider"
+  },
+  "llm_split_prompt": {
+    "type": "string",
+    "default": "请将以下文本分成{n}个段落，要求每段语义完整，长度尽量均匀。仅输出JSON数组格式，如: [\"段1\", \"段2\", \"段3\"]\n\n原文：\n{text}",
+    "description": "LLM分段提示词模板",
+    "hint": "可用变量: {n}=目标段数, {text}=原文"
+  },
+  "delay_strategy": {
+    "type": "string",
+    "options": ["linear", "log", "random", "fixed"],
+    "default": "linear",
+    "description": "分段发送延迟策略",
+    "hint": "linear: 线性延迟; log: 对数延迟; random: 随机; fixed: 固定"
+  },
+  "linear_base": {
+    "type": "float",
+    "default": 0.3,
+    "description": "线性延迟基础时间(秒)"
+  },
+  "linear_factor": {
+    "type": "float",
+    "default": 0.05,
+    "description": "线性延迟单字系数(秒/字)"
+  },
+  "log_base": {
+    "type": "float",
+    "default": 0.3,
+    "description": "对数延迟基础时间(秒)"
+  },
+  "log_factor": {
+    "type": "float",
+    "default": 0.5,
+    "description": "对数延迟系数"
+  },
+  "random_min": {
+    "type": "float",
+    "default": 0.5,
+    "description": "随机延迟最小值(秒)"
+  },
+  "random_max": {
+    "type": "float",
+    "default": 2.0,
+    "description": "随机延迟最大值(秒)"
+  },
+  "fixed_delay": {
+    "type": "float",
+    "default": 1.0,
+    "description": "固定延迟时间(秒)"
+  },
+  "enable_reply": {
+    "type": "bool",
+    "default": true,
+    "description": "保留回复引用",
+    "hint": "开启后在第一段消息中引用用户原消息"
+  }
+}
