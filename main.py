@@ -1,5 +1,5 @@
 """
-Nova Splitter - 智能消息分段插件 v1.1.0
+Nova Splitter - 智能消息分段插件 v1.1.1
 作者: Nova for 辉宝主人
 功能: 
   1. 按字数均分分段（强制标点边界，绝不在词语中间断开）
@@ -450,15 +450,15 @@ class PunctuationProcessor:
             logger.error(f"[Nova-Splitter] \u81ea\u5b9a\u4e49\u6b63\u5219\u9519\u8bef: {e}")
             return text
 
-@register("nova-splitter", "Nova", "智能消息分段插件 - 支持按字数/标点/LLM分段，智能标点清理", "1.1.0")
+@register("nova-splitter", "Nova", "智能消息分段插件 - 支持按字数/标点/LLM分段，智能标点清理", "1.1.1")
 class NovaSplitterPlugin(Star):
-    """Nova智能分段插件 v1.1.0"""
+    """Nova智能分段插件 v1.1.1"""
     
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
         self.punctuation_processor = PunctuationProcessor(dict(config))
-        logger.info("[Nova-Splitter] 插件已初始化 v1.1.0")
+        logger.info("[Nova-Splitter] 插件已初始化 v1.1.1")
         logger.info(f"[Nova-Splitter] 分段模式: {config.get('split_mode', 'char_count')}")
         logger.info(f"[Nova-Splitter] 标点清理模式: {config.get('punctuation_clean_mode', 'edge_only')}")
     
@@ -502,11 +502,16 @@ class NovaSplitterPlugin(Star):
             logger.info(f"[Nova-Splitter] 非LLM回复，跳过")
             return
         
-        # 提取文本内容
+        # 提取文本内容，同时记录非文本组件的位置
         full_text = ""
+        # comp_positions: list of (char_offset, component) 记录非文本组件在纯文本中的位置
+        comp_positions = []
         for comp in result.chain:
             if isinstance(comp, Plain):
                 full_text += comp.text
+            else:
+                # 记录这个非文本组件出现时，纯文本已经累积到的偏移量
+                comp_positions.append((len(full_text), comp))
         
         if not full_text.strip():
             logger.info(f"[Nova-Splitter] 文本为空，跳过")
@@ -569,29 +574,59 @@ class NovaSplitterPlugin(Star):
         
         logger.info(f"[Nova-Splitter] 消息被分为 {len(segments)} 段")
         
-        # 处理非文本组件
-        other_components = [c for c in result.chain if not isinstance(c, Plain)]
+        # 分离 Reply 组件（保留到最后一段交给框架）
+        reply_components = [c for c in result.chain if isinstance(c, Reply)]
         
-        # 构建分段消息链
+        # 计算每个分段在 full_text 中的字符范围 [seg_start, seg_end)
+        # 用于将非文本组件按偏移量分配到正确的段
+        seg_ranges = []  # list of (start_offset, end_offset)
+        offset = 0
+        for seg_text in segments:
+            seg_start = full_text.find(seg_text, offset)
+            if seg_start == -1:
+                # LLM 模式下分段文本可能被修改过，用累积偏移量
+                seg_start = offset
+            seg_end = seg_start + len(seg_text)
+            seg_ranges.append((seg_start, seg_end))
+            offset = seg_end
+        
+        logger.info(f"[Nova-Splitter] 分段范围: {seg_ranges}")
+        logger.info(f"[Nova-Splitter] 非文本组件位置: {[(pos, type(c).__name__) for pos, c in comp_positions]}")
+        
+        # 构建分段消息链，按偏移量分配非文本组件
         message_segments = []
         for i, seg_text in enumerate(segments):
-            seg_chain = [Plain(seg_text)]
-            if i == 0:
-                for comp in other_components:
-                    if isinstance(comp, Reply):
-                        seg_chain.insert(0, comp)
-                    else:
-                        seg_chain.append(comp)
+            seg_chain = []
+            seg_start, seg_end = seg_ranges[i]
+            
+            # 找到属于这个段的非文本组件（按偏移量匹配）
+            # 组件偏移量在 [seg_start, seg_end) 范围内的，属于这个段
+            for comp_offset, comp in comp_positions:
+                if isinstance(comp, Reply):
+                    continue  # Reply 单独处理
+                if seg_start <= comp_offset < seg_end:
+                    # 在文本的对应位置插入组件
+                    # 先添加组件之前的文本部分
+                    text_before = seg_text[:comp_offset - seg_start]
+                    text_after = seg_text[comp_offset - seg_start:]
+                    if text_before:
+                        seg_chain.append(Plain(text_before))
+                    seg_chain.append(comp)
+                    seg_text = text_after  # 剩余文本
+                    seg_start = comp_offset  # 更新起始偏移
+            
+            # 添加剩余文本
+            if seg_text:
+                seg_chain.append(Plain(seg_text))
+            
+            # 如果这个段没有任何内容，添加空 Plain
+            if not seg_chain:
+                seg_chain.append(Plain(""))
+            
             message_segments.append(seg_chain)
         
-        # 添加回复引用到第一段
-        enable_reply = self.config.get("enable_reply", True)
-        if enable_reply and message_segments and event.message_obj.message_id:
-            has_reply = any(isinstance(c, Reply) for c in message_segments[0])
-            if not has_reply:
-                message_segments[0].insert(0, Reply(id=event.message_obj.message_id))
-        
-        # 发送前 N-1 段
+        # 发送前 N-1 段 (纯文本，不带Reply)
+        failed_texts = []
         for i in range(len(message_segments) - 1):
             seg_chain = message_segments[i]
             seg_text = "".join([c.text for c in seg_chain if isinstance(c, Plain)])
@@ -610,9 +645,25 @@ class NovaSplitterPlugin(Star):
                 await asyncio.sleep(delay)
             except Exception as e:
                 logger.error(f"[Nova-Splitter] 发送分段 {i+1} 失败: {e}")
+                failed_texts.append(seg_text)
         
         # 最后一段交给框架
         last_chain = message_segments[-1]
+        
+        # 如果有发送失败的段落，合并到最后一段开头
+        if failed_texts:
+            last_text = "".join([c.text for c in last_chain if isinstance(c, Plain)])
+            combined_text = "\n".join(failed_texts) + "\n" + last_text
+            last_chain = [Plain(combined_text)]
+            for comp in non_reply_components:
+                last_chain.append(comp)
+            logger.info(f"[Nova-Splitter] 有 {len(failed_texts)} 段发送失败，已合并到最后一段")
+        
+        # 将其他插件(如OutputPro)添加的Reply保留到最后一段
+        # 这样框架发送最后一段时会带上引用
+        for reply_comp in reply_components:
+            last_chain.insert(0, reply_comp)
+        
         self._log_segment(len(message_segments), len(message_segments), last_chain, "交给框架")
         
         result.chain.clear()
