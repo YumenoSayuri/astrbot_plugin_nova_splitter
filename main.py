@@ -22,7 +22,7 @@ from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.provider import LLMResponse, Provider
-from astrbot.api.message_components import Plain, BaseMessageComponent, Reply
+from astrbot.api.message_components import Plain, BaseMessageComponent, Reply, At
 
 
 @dataclass
@@ -381,7 +381,7 @@ class LLMAssistSplitter(SplitStrategy):
             logger.warning(f"[Nova-Splitter] LLM\u8fd4\u56de\u683c\u5f0f\u5f02\u5e38\uff0c\u56de\u9000\u5230\u6309\u5b57\u6570\u5206\u6bb5: {result_text[:100]}")
             
         except asyncio.TimeoutError:
-            logger.error(f"[Nova-Splitter] LLM\u5206\u6bb5\u8d85\u65f6(15s)\uff0c\u56de\u9000\u5230\u6309\u5b57\u6570\u5206\u6bb5")
+            logger.error(f"[Nova-Splitter] LLM分段超时({llm_timeout}s)，回退到按字数分段")
         except Exception as e:
             logger.error(f"[Nova-Splitter] LLM\u5206\u6bb5\u5931\u8d25: {type(e).__name__}: {e}")
             logger.debug(f"[Nova-Splitter] LLM\u5206\u6bb5\u5f02\u5e38\u8be6\u60c5:\n{traceback.format_exc()}")
@@ -503,15 +503,40 @@ class NovaSplitterPlugin(Star):
             return
         
         # 提取文本内容，同时记录非文本组件的位置
+        # 同时解析 Plain 文本中的 [at:xxx] / [At:xxx] 标记，转换为 At 组件
         full_text = ""
         # comp_positions: list of (char_offset, component) 记录非文本组件在纯文本中的位置
         comp_positions = []
+        
+        # 用于匹配文本中的 [at:数字] 和 [At:数字] 标记
+        at_text_regex = re.compile(r'\[(?:at|At)[:：]\s*(\d+)\]', re.IGNORECASE)
+        
+        chain_debug = []
         for comp in result.chain:
             if isinstance(comp, Plain):
-                full_text += comp.text
+                # 解析 Plain 文本中的 [at:xxx] 标记
+                text = comp.text
+                last_end = 0
+                for m in at_text_regex.finditer(text):
+                    # 添加标记之前的文本
+                    before = text[last_end:m.start()]
+                    if before:
+                        full_text += before
+                    # 记录 At 组件的偏移量
+                    at_qq = m.group(1)
+                    comp_positions.append((len(full_text), At(qq=at_qq)))
+                    logger.info(f"[Nova-Splitter] 解析到文本中的at标记: [at:{at_qq}] 偏移量={len(full_text)}")
+                    last_end = m.end()
+                # 添加最后一段文本
+                remaining = text[last_end:]
+                if remaining:
+                    full_text += remaining
+                chain_debug.append(f"Plain({text[:30]}...)" if len(text) > 30 else f"Plain({text})")
             else:
-                # 记录这个非文本组件出现时，纯文本已经累积到的偏移量
-                comp_positions.append((len(full_text), comp))
+                chain_debug.append(f"{type(comp).__name__}")
+                if not isinstance(comp, Reply):
+                    comp_positions.append((len(full_text), comp))
+        logger.info(f"[Nova-Splitter] 原始chain结构: {' | '.join(chain_debug)}")
         
         if not full_text.strip():
             logger.info(f"[Nova-Splitter] 文本为空，跳过")
