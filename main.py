@@ -550,23 +550,36 @@ class NovaSplitterPlugin(Star):
         if not completion_text:
             return
         
-        # 提取思维链内容
+        # 提取思维链内容（多重兼容）
         tag = self.config.get("thought_tag", "thought")
-        thought_pattern = re.compile(
-            rf'<{re.escape(tag)}>(.*?)</{re.escape(tag)}>',
-            re.DOTALL
-        )
+        tag_e = re.escape(tag)
         
-        thought_match = thought_pattern.search(completion_text)
         thought_content = ""
         reply_content = completion_text
+        found_thought = False
+        
+        # 策略1：标准匹配 <thought>...</thought> 或 thought>...</thought>
+        thought_pattern = re.compile(
+            rf'<?{tag_e}>(.*?)</{tag_e}>',
+            re.DOTALL
+        )
+        thought_match = thought_pattern.search(completion_text)
         
         if thought_match:
             thought_content = thought_match.group(1).strip()
-            # 从回复中移除思维链部分
             reply_content = thought_pattern.sub('', completion_text).strip()
-            
-            # 缓存思维链（按 session_id 保留最近1条）
+            found_thought = True
+        else:
+            # 策略2：只有闭合标签 </thought>，把它之前的内容当思维链
+            close_tag = f"</{tag}>"
+            close_pos = completion_text.find(close_tag)
+            if close_pos > 0:
+                thought_content = completion_text[:close_pos].strip()
+                reply_content = completion_text[close_pos + len(close_tag):].strip()
+                found_thought = True
+                logger.info(f"[Nova-Splitter] 兼容模式：以 </{tag}> 为分隔点提取思维链")
+        
+        if found_thought:
             session_id = event.get_session_id()
             self.thought_cache[session_id] = thought_content
             logger.info(f"[Nova-Splitter] 提取思维链: {thought_content[:80]}...")
