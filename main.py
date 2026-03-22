@@ -489,9 +489,9 @@ class NovaSplitterPlugin(Star):
                     request.system_prompt = guide_prompt
                 
                 # 2. 用户消息后追加简短强调提醒（提高遵循率）
-                from astrbot.core.agent.message import ContentPart
+                from astrbot.core.agent.message import TextPart
                 request.extra_user_content_parts.append(
-                    ContentPart(type="text", text="[系统提醒：回复前必须先输出<thought>思考内容</thought>，然后再写回复]")
+                    TextPart(text="[系统提醒：回复前必须先输出<thought>思考内容</thought>，然后再写回复]")
                 )
                 logger.info("[Nova-Splitter] 已注入引导思考prompt（双重注入）")
     
