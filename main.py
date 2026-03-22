@@ -1,7 +1,7 @@
 """
-Nova Splitter - 智能消息分段 + 引导思考 + 睡眠模式 v1.2.0
+Nova Splitter - 智能消息分段 + 引导思考 + 睡眠模式 v1.3.0
 作者: Nova for 辉宝主人
-功能: 
+功能:
   1. 按字数均分分段（强制标点边界，绝不在词语中间断开）
   2. 按标点分段
   3. LLM辅助智能分段（带超时保护和完善的异常处理）
@@ -9,17 +9,22 @@ Nova Splitter - 智能消息分段 + 引导思考 + 睡眠模式 v1.2.0
   5. 引导思考（让AI先思考再回复，思维链拦截与缓存）
   6. 沉默机制（AI决定不回复时完全拦截）
   7. 睡眠模式（管理员指令控制AI休眠/唤醒）
+  8. sexlife联动（自动根据日程切换睡眠/唤醒状态）
 """
 
 import re
+import os
+import json
 import math
 import random
 import asyncio
 import uuid
+import datetime
 import traceback
 from abc import ABC, abstractmethod
 from typing import List, Dict, Optional, Tuple
 from dataclasses import dataclass
+from pathlib import Path
 
 from astrbot.api.event import filter, AstrMessageEvent, MessageChain
 from astrbot.api.star import Context, Star, register
@@ -428,9 +433,9 @@ class PunctuationProcessor:
             logger.error(f"[Nova-Splitter] \u81ea\u5b9a\u4e49\u6b63\u5219\u9519\u8bef: {e}")
             return text
 
-@register("nova-splitter", "Nova", "智能消息分段 + 引导思考 + 睡眠模式", "1.2.0")
+@register("nova-splitter", "Nova", "智能消息分段 + 引导思考 + 睡眠联动", "1.3.0")
 class NovaSplitterPlugin(Star):
-    """Nova智能分段插件 v1.2.0"""
+    """Nova智能分段插件 v1.3.0"""
     
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -443,10 +448,16 @@ class NovaSplitterPlugin(Star):
         # 睡眠状态: 全局标志
         self.is_sleeping: bool = False
         
-        logger.info("[Nova-Splitter] 插件已初始化 v1.2.0")
+        # sexlife 联动：缓存的睡觉时段列表 [(start_minutes, end_minutes), ...]
+        self._sleep_periods: List[Tuple[int, int]] = []
+        # 手动睡眠覆盖：True=手动睡觉, False=手动起床, None=自动（由日程决定）
+        self._manual_sleep_override: Optional[bool] = None
+        
+        logger.info("[Nova-Splitter] 插件已初始化 v1.3.0")
         logger.info(f"[Nova-Splitter] 分段模式: {config.get('split_mode', 'char_count')}")
         logger.info(f"[Nova-Splitter] 引导思考: {'启用' if config.get('enable_thought_guide', False) else '关闭'}")
         logger.info(f"[Nova-Splitter] 睡眠模式: {'启用' if config.get('enable_sleep_mode', False) else '关闭'}")
+        logger.info(f"[Nova-Splitter] sexlife联动: {'启用' if config.get('sleep_auto_schedule', False) else '关闭'}")
     
     # ==================== 引导思考：注入 system prompt ====================
     
@@ -454,8 +465,11 @@ class NovaSplitterPlugin(Star):
     async def on_llm_request(self, event: AstrMessageEvent, request: ProviderRequest):
         """在LLM请求前注入引导思考prompt + 睡眠拦截（含白名单）"""
         
+        # 睡眠状态实时判断（自动模式用时段判断，手动模式用标志）
+        actual_sleeping = self._get_actual_sleep_state()
+        
         # 睡眠模式检查
-        if self.is_sleeping and self.config.get("enable_sleep_mode", False):
+        if actual_sleeping and self.config.get("enable_sleep_mode", False):
             # 检查白名单放行
             if self._check_sleep_whitelist(event):
                 logger.info("[Nova-Splitter] 睡眠模式白名单放行")
@@ -609,7 +623,7 @@ class NovaSplitterPlugin(Star):
     
     # ==================== 指令：睡觉 / 起床 ====================
     
-    @filter.command("睡觉", alias={"睡吧", "去睡觉", "晚安"})
+    @filter.command("快去睡觉")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_sleep(self, event: AstrMessageEvent):
         """让AI进入睡眠模式（管理员专用）"""
@@ -618,15 +632,16 @@ class NovaSplitterPlugin(Star):
             yield event.plain_result("睡眠模式未启用")
             return
         
-        if self.is_sleeping:
+        if self._get_actual_sleep_state():
             yield event.plain_result("嗯...已经睡了...")
             return
         
+        self._manual_sleep_override = True  # 手动睡觉
         self.is_sleeping = True
-        logger.info("[Nova-Splitter] AI已进入睡眠模式")
+        logger.info("[Nova-Splitter] AI已进入睡眠模式（手动）")
         yield event.plain_result("嗯 晚安（")
     
-    @filter.command("起床", alias={"醒醒", "早安", "起来"})
+    @filter.command("快点起床")
     @filter.permission_type(filter.PermissionType.ADMIN)
     async def cmd_wake(self, event: AstrMessageEvent):
         """唤醒AI（管理员专用）"""
@@ -635,13 +650,190 @@ class NovaSplitterPlugin(Star):
             yield event.plain_result("睡眠模式未启用")
             return
         
-        if not self.is_sleeping:
+        if not self._get_actual_sleep_state():
             yield event.plain_result("本来就醒着呢")
             return
         
         self.is_sleeping = False
         logger.info("[Nova-Splitter] AI已从睡眠模式唤醒")
+        self._manual_sleep_override = False  # 手动起床
+        self.is_sleeping = False
         yield event.plain_result("唔...早安（")
+    
+    def _get_actual_sleep_state(self) -> bool:
+        """获取实际的睡眠状态
+        
+        优先级：手动覆盖 > 自动日程判断 > is_sleeping 标志
+        """
+        # 手动覆盖优先
+        if self._manual_sleep_override is not None:
+            return self._manual_sleep_override
+        
+        # 自动日程判断
+        if self.config.get("sleep_auto_schedule", False) and self._sleep_periods:
+            now = datetime.datetime.now()
+            current_minutes = now.hour * 60 + now.minute
+            return self._is_in_sleep_period(current_minutes)
+        
+        # 回退到手动标志
+        return self.is_sleeping
+    
+    # ==================== sexlife 联动定时睡眠 ====================
+    
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self, *args, **kwargs):
+        """AstrBot 加载完成后启动 sexlife 联动每日定时读取"""
+        if not self.config.get("sleep_auto_schedule", False):
+            logger.info("[Nova-Splitter] sexlife联动未启用，跳过")
+            return
+        if not self.config.get("enable_sleep_mode", False):
+            logger.info("[Nova-Splitter] 睡眠模式未启用，sexlife联动无法生效")
+            return
+        
+        # 首次启动时立即读取一次
+        self._read_sexlife_schedule()
+        
+        # 每天定时读取一次（cron 任务）
+        read_time = self.config.get("sleep_schedule_read_time", "00:05")
+        try:
+            hour, minute = map(int, read_time.split(":"))
+        except (ValueError, AttributeError):
+            hour, minute = 0, 5
+        
+        # 使用 asyncio 创建每日定时任务
+        self._schedule_checker_task = asyncio.create_task(
+            self._daily_cron_reader(hour, minute)
+        )
+        logger.info(f"[Nova-Splitter] sexlife联动已启动，每天 {hour:02d}:{minute:02d} 读取日程")
+    
+    async def _daily_cron_reader(self, hour: int, minute: int):
+        """每天定时读取 sexlife 日程（简易 cron）"""
+        try:
+            while True:
+                now = datetime.datetime.now()
+                # 计算下一个执行时间
+                target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if target <= now:
+                    target += datetime.timedelta(days=1)
+                
+                wait_seconds = (target - now).total_seconds()
+                logger.info(f"[Nova-Splitter] 下次日程读取: {target.strftime('%Y-%m-%d %H:%M')} ({wait_seconds:.0f}s后)")
+                
+                await asyncio.sleep(wait_seconds)
+                
+                # 执行读取
+                self._read_sexlife_schedule()
+                # 读取日程后清除手动覆盖，让自动判断生效
+                self._manual_sleep_override = None
+                logger.info("[Nova-Splitter] 每日定时日程读取完成，已切换到自动模式")
+                
+                # 等1秒避免重复触发
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            logger.info("[Nova-Splitter] sexlife联动定时器已停止")
+    
+    def _read_sexlife_schedule(self):
+        """读取 sexlife 的 schedule_data.json，提取今天的睡觉时段"""
+        # sexlife 数据路径
+        sexlife_data_path = Path("data/plugin_data/astrbot_plugin_sexlife/schedule_data.json")
+        
+        if not sexlife_data_path.exists():
+            logger.debug("[Nova-Splitter] sexlife日程文件不存在")
+            self._sleep_periods = []
+            return
+        
+        try:
+            raw = json.loads(sexlife_data_path.read_text(encoding="utf-8"))
+        except Exception as e:
+            logger.error(f"[Nova-Splitter] 读取sexlife日程失败: {e}")
+            self._sleep_periods = []
+            return
+        
+        # 获取今天的日期 key
+        today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        today_data = raw.get(today_str)
+        
+        if not today_data or not isinstance(today_data, dict):
+            logger.debug(f"[Nova-Splitter] sexlife无今日({today_str})日程数据")
+            self._sleep_periods = []
+            return
+        
+        timeline = today_data.get("timeline", [])
+        if not isinstance(timeline, list):
+            self._sleep_periods = []
+            return
+        
+        # 获取睡觉关键词
+        keywords_str = self.config.get("sleep_schedule_keywords", "梦乡,睡觉,入睡,睡眠,深度睡眠,睡前,晚安")
+        keywords = [kw.strip().lower() for kw in keywords_str.split(",") if kw.strip()]
+        
+        sleep_periods = []
+        for entry in timeline:
+            if not isinstance(entry, dict):
+                continue
+            title = str(entry.get("title", "")).lower()
+            # 检查标题是否包含睡觉关键词
+            is_sleep = any(kw in title for kw in keywords)
+            if is_sleep:
+                try:
+                    start_h, start_m = map(int, entry["time_start"].split(":"))
+                    end_h, end_m = map(int, entry["time_end"].split(":"))
+                    start_minutes = start_h * 60 + start_m
+                    end_minutes = end_h * 60 + end_m
+                    sleep_periods.append((start_minutes, end_minutes))
+                    logger.debug(f"[Nova-Splitter] 识别到睡觉时段: {entry['time_start']}-{entry['time_end']} ({title})")
+                except (ValueError, KeyError) as e:
+                    logger.warning(f"[Nova-Splitter] 解析时段失败: {e}")
+        
+        self._sleep_periods = sleep_periods
+        if sleep_periods:
+            periods_str = ", ".join([f"{p[0]//60}:{p[0]%60:02d}-{p[1]//60}:{p[1]%60:02d}" for p in sleep_periods])
+            logger.info(f"[Nova-Splitter] 今日睡觉时段: {periods_str}")
+    
+    def _is_in_sleep_period(self, current_minutes: int) -> bool:
+        """判断当前时间（分钟数）是否在任一睡觉时段内
+        
+        支持跨午夜的时段，如 22:00-08:00
+        """
+        for start, end in self._sleep_periods:
+            if start <= end:
+                # 正常时段：如 00:00-08:00
+                if start <= current_minutes < end:
+                    return True
+            else:
+                # 跨午夜时段：如 22:00-08:00
+                if current_minutes >= start or current_minutes < end:
+                    return True
+        return False
+    
+    @filter.command("读取日程")
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    async def cmd_read_schedule(self, event: AstrMessageEvent):
+        """手动读取sexlife日程并更新睡眠状态（管理员专用）"""
+        setattr(event, "__nova_splitter_own_cmd", True)
+        
+        self._read_sexlife_schedule()
+        
+        if not self._sleep_periods:
+            yield event.plain_result("没有读取到今日的睡觉时段")
+            return
+        
+        periods_str = "\n".join([
+            f"  {p[0]//60}:{p[0]%60:02d} - {p[1]//60}:{p[1]%60:02d}"
+            for p in self._sleep_periods
+        ])
+        
+        now = datetime.datetime.now()
+        current_minutes = now.hour * 60 + now.minute
+        in_sleep = self._is_in_sleep_period(current_minutes)
+        # 手动读取后清除手动覆盖，让自动判断接管
+        self._manual_sleep_override = None
+        self.is_sleeping = in_sleep
+        
+        status = "睡觉中" if in_sleep else "醒着"
+        yield event.plain_result(
+            f"今日睡觉时段：\n{periods_str}\n当前状态：{status}"
+        )
     
     # ==================== 消息分段处理 ====================
     
@@ -652,7 +844,7 @@ class NovaSplitterPlugin(Star):
         
         # 完全静默检查：睡眠模式 + sleep_full_silence 开启时
         # 拦截所有非本插件指令的消息发送
-        if (self.is_sleeping
+        if (self._get_actual_sleep_state()
             and self.config.get("enable_sleep_mode", False)
             and self.config.get("sleep_full_silence", False)
             and not getattr(event, "__nova_splitter_own_cmd", False)):
