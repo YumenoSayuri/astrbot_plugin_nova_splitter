@@ -478,15 +478,22 @@ class NovaSplitterPlugin(Star):
                 event.stop_event()
                 return
         
-        # 引导思考：追加到 system_prompt 末尾
+        # 引导思考：双重注入（system prompt + 用户消息附加）
         if self.config.get("enable_thought_guide", False):
             guide_prompt = self.config.get("thought_guide_prompt", "")
             if guide_prompt:
+                # 1. system prompt 末尾追加完整引导
                 if request.system_prompt:
                     request.system_prompt += "\n\n" + guide_prompt
                 else:
                     request.system_prompt = guide_prompt
-                logger.info("[Nova-Splitter] 已注入引导思考prompt")
+                
+                # 2. 用户消息后追加简短强调提醒（提高遵循率）
+                from astrbot.core.agent.message import ContentPart
+                request.extra_user_content_parts.append(
+                    ContentPart(type="text", text="[系统提醒：回复前必须先输出<thought>思考内容</thought>，然后再写回复]")
+                )
+                logger.info("[Nova-Splitter] 已注入引导思考prompt（双重注入）")
     
     def _check_sleep_whitelist(self, event: AstrMessageEvent) -> bool:
         """检查当前消息是否在睡眠白名单中
@@ -564,6 +571,12 @@ class NovaSplitterPlugin(Star):
             self.thought_cache[session_id] = thought_content
             logger.info(f"[Nova-Splitter] 提取思维链: {thought_content[:80]}...")
             logger.info(f"[Nova-Splitter] 实际回复: {reply_content[:80]}...")
+        else:
+            # 这次回复没有思维链，清空上次的缓存
+            session_id = event.get_session_id()
+            if session_id in self.thought_cache:
+                del self.thought_cache[session_id]
+                logger.info(f"[Nova-Splitter] 本次回复无思维链，已清空缓存")
         
         # 检测沉默关键词
         silence_keywords_str = self.config.get("silence_keywords", "沉默,静默,不想回复,不回复,不想搭理,没必要回复")
