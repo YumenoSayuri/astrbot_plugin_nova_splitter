@@ -723,8 +723,8 @@ class NovaSplitterPlugin(Star):
         except Exception as e:
             logger.error(f"[Nova-Splitter] 思维链转发失败: {e}")
     
-    def _strip_thought_from_chain(self, chain: List[BaseMessageComponent]):
-        """从消息链中移除 <thought> 标签内容（兜底清理）"""
+    def _strip_thought_from_chain(self, chain: List[BaseMessageComponent], event: AstrMessageEvent = None):
+        """从消息链中移除 <thought> 标签内容（兜底清理），同时提取并转发"""
         tag = self.config.get("thought_tag", "thought")
         tag_e = re.escape(tag)
         # 匹配完整标签或缺少开头<的标签
@@ -733,19 +733,39 @@ class NovaSplitterPlugin(Star):
         for i, comp in enumerate(chain):
             if isinstance(comp, Plain) and comp.text:
                 original = comp.text
-                # 策略1：正则移除
-                cleaned = pattern.sub('', original)
-                # 策略2：用闭合标签分隔
-                if cleaned == original:
+                thought_extracted = ""
+                
+                # 策略1：正则提取+移除
+                match = pattern.search(original)
+                if match:
+                    thought_extracted = match.group(1).strip()
+                    cleaned = pattern.sub('', original)
+                else:
+                    # 策略2：用闭合标签分隔
+                    cleaned = original
                     close_tag = f"</{tag}>"
                     close_pos = original.find(close_tag)
                     if close_pos > 0:
+                        thought_extracted = original[:close_pos].strip()
                         cleaned = original[close_pos + len(close_tag):]
                 
                 cleaned = cleaned.strip()
                 if cleaned != original.strip():
                     chain[i] = Plain(cleaned)
                     logger.info(f"[Nova-Splitter] 兜底清理：从chain中移除了thought标签")
+                    
+                    # 兜底转发：如果提取到思维内容且启用了转发
+                    if thought_extracted and event and self.config.get("thought_forward_enabled", False):
+                        forward_target = self.config.get("thought_forward_target", "").strip()
+                        if forward_target:
+                            asyncio.create_task(
+                                self._forward_thought(event, thought_extracted, forward_target)
+                            )
+                    
+                    # 兜底缓存
+                    if thought_extracted and event:
+                        session_id = event.get_session_id()
+                        self.thought_cache[session_id] = thought_extracted
     
     def _get_actual_sleep_state(self) -> bool:
         """获取实际的睡眠状态
@@ -934,7 +954,7 @@ class NovaSplitterPlugin(Star):
         if self.config.get("enable_thought_guide", False):
             result = event.get_result()
             if result and result.chain:
-                self._strip_thought_from_chain(result.chain)
+                self._strip_thought_from_chain(result.chain, event)
                 # 清理后如果所有文本都为空，阻止发送（防止工具调用中间结果发空消息）
                 all_text = "".join(
                     c.text for c in result.chain if isinstance(c, Plain)
