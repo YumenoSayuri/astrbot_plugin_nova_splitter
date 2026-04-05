@@ -471,8 +471,7 @@ class NovaOmniPlugin(Star):
         provider = self.context.get_using_provider(event.unified_msg_origin)
         if provider:
             setattr(event, "__nova_omni_original_provider", provider)
-            setattr(event, "__nova_omni_original_provider_id", provider.id)
-        
+            
         # 睡眠状态实时判断（自动模式用时段判断，手动模式用标志）
         actual_sleeping = self._get_actual_sleep_state()
         
