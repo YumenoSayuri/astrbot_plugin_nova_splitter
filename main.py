@@ -532,7 +532,7 @@ class NovaOmniPlugin(Star):
                 # 如果全部失败，为了不阻断流程，制造一个空的备用回复抛出，让后面的逻辑继续（通常会被过滤）
                 if not retry_success and not final_resp:
                     from astrbot.core.provider.entities import LLMResponse
-                    final_resp = LLMResponse(completion_text="")
+                    final_resp = LLMResponse(role="assistant", completion_text="")
                     
                 return final_resp
             
