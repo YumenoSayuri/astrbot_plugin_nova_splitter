@@ -460,108 +460,17 @@ class NovaOmniPlugin(Star):
         logger.info(f"[Nova-Omni] 睡眠模式: {'启用' if config.get('enable_sleep_mode', False) else '关闭'}")
         logger.info(f"[Nova-Omni] sexlife联动: {'启用' if config.get('sleep_auto_schedule', False) else '关闭'}")
     
-    # ==================== LLM请求拦截：全域底层防御 + 引导思考注入 ====================
+    # ==================== LLM请求拦截：空回兜底状态保存 + 引导思考注入 ====================
     
     @filter.on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, request: ProviderRequest):
-        """在LLM请求前：1. 劫持底层通信函数，植入全域异常与空回重试防御网 2.注入引导思考prompt 3.睡眠拦截"""
+        """在LLM请求前：1. 保存请求武器库用于空回重试 2.注入引导思考prompt 3.睡眠拦截"""
         
+        # 将原始请求武器和提供商缓存到事件上下文，为后续防御做准备
+        setattr(event, "__nova_omni_provider_request", request)
         provider = self.context.get_using_provider(event.unified_msg_origin)
-        
-        # --- 全域底层重试防御网注入 (Monkey Patching) ---
-        if provider and not getattr(provider, "__nova_omni_patched", False):
-            original_text_chat = provider.text_chat
-            
-            async def patched_text_chat(*args, **kwargs):
-                max_retries = self.config.get("empty_retry_count", 3)
-                use_backup = self.config.get("empty_retry_use_backup", False)
-                backup_provider_id = self.config.get("empty_retry_provider_id", "")
-                max_wait_time = float(self.config.get("llm_max_wait_time", 60.0))
-                retry_on_error = self.config.get("retry_on_error", True)
-                
-                retry_success = False
-                final_resp = None
-                
-                for attempt in range(1, max_retries + 1):
-                    try:
-                        if attempt == 1:
-                            logger.info(f"[Nova-Omni] 正在发起正常请求... (最长等待: {max_wait_time}s)")
-                        else:
-                            logger.info(f"[Nova-Omni] 正在发起底层拦截重试打击... (第 {attempt}/{max_retries} 次)")
-                        
-                        # 控制底层调用的最长等待时间
-                        resp = await asyncio.wait_for(original_text_chat(*args, **kwargs), timeout=max_wait_time)
-                        
-                        if resp and resp.completion_text and resp.completion_text.strip():
-                            if attempt == 1:
-                                logger.info(f"[Nova-Omni] 请求成功！获取到有效回复: {resp.completion_text[:50]}...")
-                            else:
-                                logger.info(f"[Nova-Omni] 重试打击成功！获取到有效回复: {resp.completion_text[:50]}...")
-                            final_resp = resp
-                            retry_success = True
-                            break
-                        else:
-                            action_name = "请求" if attempt == 1 else "重试打击"
-                            logger.warning(f"[Nova-Omni] 警告：第 {attempt} 次{action_name}返回了空内容！准备拦截并重新装填火力。")
-                    
-                    except asyncio.TimeoutError:
-                        action_name = "请求" if attempt == 1 else "重试打击"
-                        logger.warning(f"[Nova-Omni] 警告：第 {attempt} 次{action_name}耗时超过 {max_wait_time} 秒被强制截断！准备拦截并重新装填火力。")
-                    except Exception as e:
-                        action_name = "请求" if attempt == 1 else "重试打击"
-                        if retry_on_error:
-                            logger.error(f"[Nova-Omni] 警告：第 {attempt} 次{action_name}遭遇底层报错阻击: {type(e).__name__}: {e}，准备强行突围重试！")
-                        else:
-                            logger.error(f"[Nova-Omni] 第 {attempt} 次{action_name}遭遇底层报错: {type(e).__name__}: {e}，错误重试未开启，放弃拦截。")
-                            raise e
-                
-                # 常规火力耗尽且启用了备用支援，呼叫备用模型接管
-                last_error = None
-                if not retry_success and use_backup and backup_provider_id:
-                    logger.warning(f"[Nova-Omni] 原模型火力完全耗尽！紧急呼叫备用支援: {backup_provider_id}")
-                    backup_provider = self.context.get_provider_by_id(backup_provider_id)
-                    if backup_provider:
-                        try:
-                            # 剔除原有特定的 model 参数，让备用模型使用自己的默认模型
-                            backup_kwargs = kwargs.copy()
-                            backup_kwargs.pop("model", None)
-                            
-                            resp = await asyncio.wait_for(backup_provider.text_chat(*args, **backup_kwargs), timeout=max_wait_time)
-                            if resp and resp.completion_text and resp.completion_text.strip():
-                                logger.info(f"[Nova-Omni] 备用支援打击成功！获取到有效回复: {resp.completion_text[:50]}...")
-                                final_resp = resp
-                                retry_success = True
-                            else:
-                                logger.error("[Nova-Omni] 备用支援打击也返回了空内容。防线彻底失守。")
-                                last_error = RuntimeError("备用支援返回了空内容")
-                        except asyncio.TimeoutError as e:
-                            logger.error(f"[Nova-Omni] 备用支援打击超时({max_wait_time}s)！防线彻底失守。")
-                            last_error = e
-                        except Exception as e:
-                            logger.error(f"[Nova-Omni] 备用支援打击遭遇报错: {type(e).__name__}: {e}，防线彻底失守。")
-                            last_error = e
-                    else:
-                        logger.error(f"[Nova-Omni] 无法链接指定的备用支援 Provider: {backup_provider_id}，防线彻底失守。")
-                        last_error = ValueError(f"未找到备用支援 Provider: {backup_provider_id}")
-                
-                # 如果全部失败，为了避免核心框架崩溃，我们自己构造一个合法的空文本返回（或者带错误提示的返回）
-                if not retry_success and not final_resp:
-                    from astrbot.core.provider.entities import LLMResponse
-                    err_msg = ""
-                    if last_error:
-                        err_msg = f"[Nova-Omni 拦截提示: 经过 {max_retries} 次重试和备用接管后仍然失败，报错: {last_error}]"
-                    else:
-                        err_msg = f"[Nova-Omni 拦截提示: 经过 {max_retries} 次重试后，模型依然返回了空内容或卡死。]"
-                    logger.error(err_msg)
-                    # 必须加上 role="assistant"
-                    final_resp = LLMResponse(role="assistant", completion_text="")
-                    
-                return final_resp
-            
-            # 植入装甲并标记已劫持
-            provider.text_chat = patched_text_chat
-            setattr(provider, "__nova_omni_patched", True)
-            logger.info(f"[Nova-Omni] 已成功为当前 Provider 植入全域底层重试防御网！")
+        if provider:
+            setattr(event, "__nova_omni_original_provider", provider)
             
         # 睡眠状态实时判断（自动模式用时段判断，手动模式用标志）
         actual_sleeping = self._get_actual_sleep_state()
@@ -632,17 +541,87 @@ class NovaOmniPlugin(Star):
         
         return False
     
-    # ==================== 响应拦截：思维链 + 沉默机制 ====================
+    # ==================== 响应拦截：空回重试 + 思维链 + 沉默机制 ====================
     
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
-        """拦截LLM响应：提取思维链、检测沉默、标记LLM回复"""
+        """拦截LLM响应：空回绝对防御与重试、提取思维链、检测沉默、标记LLM回复"""
         setattr(event, "__is_llm_reply", True)
         
+        # 1. 空回绝对防御与火力重装机制
         completion_text = resp.completion_text
-        
-        # 如果依然为空，或者未开启引导思考，直接返回
-        if not completion_text or not completion_text.strip() or not self.config.get("enable_thought_guide", False):
+        if not completion_text or not completion_text.strip():
+            logger.warning("[Nova-Omni] 警告：检测到LLM返回空内容！触发绝对防御重试机制。")
+            max_retries = self.config.get("empty_retry_count", 3)
+            use_backup = self.config.get("empty_retry_use_backup", False)
+            backup_provider_id = self.config.get("empty_retry_provider_id", "")
+            
+            req = getattr(event, "__nova_omni_provider_request", None)
+            orig_provider = getattr(event, "__nova_omni_original_provider", None)
+            
+            if not req or not orig_provider:
+                logger.error("[Nova-Omni] 缺乏重试弹药(未找到原始请求或Provider)，防御失败，放行空回。")
+                return
+            
+            retry_success = False
+            for attempt in range(1, max_retries + 1):
+                logger.info(f"[Nova-Omni] 正在发起空回重试火力覆盖... (第 {attempt}/{max_retries} 次)")
+                try:
+                    # 获取原模型调用参数
+                    call_kwargs = {
+                        "prompt": req.prompt,
+                        "session_id": req.session_id,
+                        "system_prompt": req.system_prompt,
+                        "image_urls": req.image_urls,
+                        "func_tool": req.func_tool,
+                        "contexts": getattr(req, "contexts", None) or getattr(req, "conversation", None),
+                        "model": req.model,
+                        "extra_user_content_parts": req.extra_user_content_parts,
+                        "tool_calls_result": req.tool_calls_result
+                    }
+                    
+                    # 过滤掉 None 值的参数
+                    call_kwargs = {k: v for k, v in call_kwargs.items() if v is not None}
+                    
+                    new_resp = await orig_provider.text_chat(**call_kwargs)
+                    if new_resp and new_resp.completion_text and new_resp.completion_text.strip():
+                        resp.completion_text = new_resp.completion_text
+                        logger.info(f"[Nova-Omni] 防御成功！在第 {attempt} 次重试获取到有效回复: {resp.completion_text[:50]}...")
+                        retry_success = True
+                        break
+                    else:
+                        logger.warning(f"[Nova-Omni] 第 {attempt} 次重试依然为空。")
+                except Exception as e:
+                    logger.error(f"[Nova-Omni] 第 {attempt} 次重试发生异常: {e}")
+            
+            # 若常规火力耗尽且启用了备用支援，呼叫备用模型
+            if not retry_success and use_backup and backup_provider_id:
+                logger.warning(f"[Nova-Omni] 原模型重试耗尽！呼叫备用支援: {backup_provider_id}")
+                backup_provider = self.context.get_provider_by_id(backup_provider_id)
+                if backup_provider:
+                    try:
+                        # 切换提供商但不改变模型参数名，让备用提供商自己处理默认模型
+                        call_kwargs.pop("model", None)
+                        new_resp = await backup_provider.text_chat(**call_kwargs)
+                        if new_resp and new_resp.completion_text and new_resp.completion_text.strip():
+                            resp.completion_text = new_resp.completion_text
+                            logger.info(f"[Nova-Omni] 备用支援成功！获取到有效回复: {resp.completion_text[:50]}...")
+                            retry_success = True
+                        else:
+                            logger.error("[Nova-Omni] 备用支援也返回了空内容。")
+                    except Exception as e:
+                        logger.error(f"[Nova-Omni] 备用支援调用异常: {e}")
+                else:
+                    logger.error(f"[Nova-Omni] 未找到指定的备用支援 Provider: {backup_provider_id}")
+            
+            if not retry_success:
+                logger.error("[Nova-Omni] 所有重试与支援均宣告失败，防线被击穿，继续放行。")
+            
+            # 重新获取重试后可能更新的文本
+            completion_text = resp.completion_text
+
+        # 2. 如果重试后依然为空，或者未开启引导思考，直接返回
+        if not completion_text or not self.config.get("enable_thought_guide", False):
             logger.info(f"[Nova-Omni] 响应处理完毕。")
             return
         

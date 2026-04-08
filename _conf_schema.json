@@ -234,20 +234,8 @@
   "empty_retry_count": {
     "type": "int",
     "default": 3,
-    "description": "全局重试次数 (空回/报错/超时)",
-    "hint": "当检测到LLM返回空内容、发生报错或请求超时时，最多重试多少次"
-  },
-  "llm_max_wait_time": {
-    "type": "float",
-    "default": 60.0,
-    "description": "强制重试超时时间(秒)",
-    "hint": "如果大模型超过此时间未返回，强制截断并自动发起重试"
-  },
-  "retry_on_error": {
-    "type": "bool",
-    "default": true,
-    "description": "拦截错误并重试",
-    "hint": "开启后，所有的 400/429/500 等 API 报错将被拦截，并进入自动重试流程"
+    "description": "空回复重试次数",
+    "hint": "当检测到LLM返回空内容时，最多重试多少次"
   },
   "empty_retry_use_backup": {
     "type": "bool",
